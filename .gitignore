@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# Data
+data/
+*.zip
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# PNCC
+PNCC/
