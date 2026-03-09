@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
-import torchaudio
+import soundfile as sf
 import typer
 from sklearn import metrics
 from torch.utils.data import DataLoader
@@ -86,8 +86,8 @@ class Config:
 
 def load_audio(path: Path) -> tuple[np.ndarray, int]:
     """Load a wav file and return a mono float array plus its sample rate."""
-    audio, fs = torchaudio.load(path)
-    return audio.numpy().reshape(-1), int(fs)
+    audio, fs = sf.read(path, dtype="float32")
+    return audio.reshape(-1), int(fs)
 
 
 def extract_feature(audio: np.ndarray, fs: int, cfg: Config) -> np.ndarray:
