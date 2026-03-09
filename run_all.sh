@@ -24,6 +24,8 @@ declare -A GPUS=(
     [mfcc]=4
     [mfcc_39]=5
     [pncc_mfcc_78]=6
+    [pncc_n40]=7
+    [pncc_contrast]=1  # shares gpu 1 with pncc; both are lightweight
 )
 
 echo "Launching all variants (epochs=$EPOCHS, out-dir=$OUT_DIR) ..."

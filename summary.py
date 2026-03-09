@@ -11,12 +11,14 @@ from pathlib import Path
 import typer
 
 VARIANTS = {
-    "pncc":         13,
-    "pncc_39":      39,
-    "pncc_42":      42,
-    "mfcc":         13,
-    "mfcc_39":      39,
-    "pncc_mfcc_78": 78,
+    "pncc":          13,
+    "pncc_39":       39,
+    "pncc_42":       42,
+    "mfcc":          13,
+    "mfcc_39":       39,
+    "pncc_mfcc_78":  78,
+    "pncc_n40":     120,
+    "pncc_contrast": 60,
 }
 
 app = typer.Typer(add_completion=False)
