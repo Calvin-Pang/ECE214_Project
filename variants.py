@@ -41,21 +41,23 @@ def _with_deltas(feat: np.ndarray) -> np.ndarray:
 
 
 def _log_energy(audio: np.ndarray) -> np.ndarray:
-    """Log RMS frame energy, shape (1, T)."""
+    """Log RMS frame energy, shape (1, T), float32."""
     rms = librosa.feature.rms(y=audio, frame_length=_WIN, hop_length=_HOP, center=False)
-    return np.log(rms + 1e-8)
+    return np.log(rms + 1e-8).astype(np.float32)
 
 
 def _rms(audio: np.ndarray) -> np.ndarray:
-    """Raw RMS energy per frame, shape (1, T)."""
-    return librosa.feature.rms(y=audio, frame_length=_WIN, hop_length=_HOP, center=False)
+    """Raw RMS energy per frame, shape (1, T), float32."""
+    return librosa.feature.rms(
+        y=audio, frame_length=_WIN, hop_length=_HOP, center=False
+    ).astype(np.float32)
 
 
 def _zcr(audio: np.ndarray) -> np.ndarray:
-    """Zero-crossing rate per frame, shape (1, T)."""
+    """Zero-crossing rate per frame, shape (1, T), float32."""
     return librosa.feature.zero_crossing_rate(
         audio, frame_length=_WIN, hop_length=_HOP, center=False
-    )
+    ).astype(np.float32)
 
 
 def _trim(*arrs: np.ndarray) -> list[np.ndarray]:
