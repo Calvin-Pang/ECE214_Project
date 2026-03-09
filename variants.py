@@ -94,10 +94,14 @@ def _pncc_42(audio: np.ndarray, sr: int) -> np.ndarray:
 
 
 def _mfcc(audio: np.ndarray, sr: int) -> np.ndarray:
-    """MFCC, 13 coefficients — direct comparison anchor. Shape (13, T)."""
+    """MFCC, 13 coefficients — direct comparison anchor. Shape (13, T).
+
+    Uses center=True (librosa default) to match the baseline notebook exactly.
+    _trim() handles frame-count alignment when stacking with PNCC (center=False).
+    """
     return librosa.feature.mfcc(
         y=audio.astype(np.float32), sr=sr,
-        n_mfcc=13, n_fft=_N_FFT, hop_length=_HOP, win_length=_WIN, center=False,
+        n_mfcc=13, n_fft=_N_FFT, hop_length=_HOP, win_length=_WIN,
     )
 
 
