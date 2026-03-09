@@ -40,7 +40,9 @@ def _medium_time_power(power_spec: np.ndarray, M: int = 2) -> np.ndarray:
     return result
 
 
-def _asymmetric_lowpass(signal: np.ndarray, lm_a: float = 0.999, lm_b: float = 0.5) -> np.ndarray:
+def _asymmetric_lowpass(
+    signal: np.ndarray, lm_a: float = 0.999, lm_b: float = 0.5
+) -> np.ndarray:
     """Asymmetric low-pass filtering to track the signal floor.
 
     Uses a fast attack (lm_b) when the signal falls and a slow decay (lm_a)
@@ -160,8 +162,8 @@ def _spectral_weight_smoothing(
     for m in range(T):
         for l in range(L):
             l1 = max(l - N, 1)
-            l2 = min(l + N, L)  # exclusive upper bound — matches range(l1, l2) in reference
-            norm = 1.0 / (l2 - l1 + 1)  # reference uses l2-l1+1 even though range has l2-l1 elements
+            l2 = min(l + N, L)  # exclusive upper bound for slice l1:l2
+            norm = 1.0 / max(l2 - l1, 1)
             smoothed[m, l] = norm * (signal[m, l1:l2] / safe_mtp[m, l1:l2]).sum()
     return smoothed
 
@@ -188,7 +190,7 @@ def _mean_power_normalize(
     myu = np.zeros(T)
     myu[0] = 1e-4
     for m in range(1, T):
-        myu[m] = lam_myu * myu[m - 1] + (1 - lam_myu) / L * transfer[m, : L - 1].sum()
+        myu[m] = lam_myu * myu[m - 1] + (1 - lam_myu) / L * transfer[m].sum()
     safe_myu = np.where(myu == 0, 1e-30, myu)
     return k * transfer / safe_myu[:, None]
 

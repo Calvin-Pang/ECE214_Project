@@ -1,19 +1,26 @@
 """Noise-robust spoken digit recognition — PNCC feature experiment.
 
 Ported from baseline.ipynb. Changes vs. the baseline:
-  1. extract_feature() uses PNCC instead of MFCC.
+  1. extract_feature() dispatches to a named variant in variants.py.
   2. Z-score normalisation (fit on training set) is applied to all feature sets.
-
-The LSTM model, training loop, optimizer, LR, and batch size are identical to
-the baseline notebook and must not be changed for the main results.
+  3. Results (config, per-epoch metrics, checkpoint, confusion-matrix PNGs) are
+     saved to --out-dir/<variant>/ so experiments can run in parallel.
 
 Usage:
     uv run main.py --help
-    uv run main.py --gpu-id 1
-    uv run main.py --gpu-id 0 --data-root /mnt/data
+    uv run main.py --variant pncc_39 --gpu-id 0
+    uv run main.py --variant mfcc_39 --gpu-id 1 --out-dir results
+
+Parallel run (all variants):
+    for v in pncc pncc_39 pncc_42 mfcc mfcc_39 pncc_mfcc_78; do
+        uv run main.py --variant $v --gpu-id 0 --out-dir results &
+    done
+    wait
 """
 
 import copy
+import dataclasses
+import json
 import os
 import random
 from dataclasses import dataclass, field
@@ -21,14 +28,15 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import soundfile as sf
 import torch
 import torch.nn as nn
-import soundfile as sf
 import typer
 from sklearn import metrics
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from features import extract_pncc
+from variants import VARIANTS
 
 # Must be set before any CUDA operations for deterministic kernels.
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -51,16 +59,12 @@ class Config:
     gpu_id: int = 0
     seed: int = 0
     num_epochs: int = 40
+    variant: str = "pncc"
+    out_dir: Path = field(default_factory=lambda: Path("results"))
 
     # Fixed baseline hyperparameters — do not expose as CLI options
     batch_size: int = 32
     lr: float = 3e-4
-
-    # PNCC framing — matched to MFCC baseline (8 kHz audio)
-    n_pncc: int = 13
-    win_length: int = 200  # 25 ms at 8 kHz
-    hop_length: int = 80   # 10 ms at 8 kHz
-    n_fft: int = 256
 
     @property
     def train_dir(self) -> Path:
@@ -78,6 +82,10 @@ class Config:
     def test_noisy_10db_dir(self) -> Path:
         return self.data_root / "test_snr_10db_babble"
 
+    @property
+    def variant_dir(self) -> Path:
+        return self.out_dir / self.variant
+
 
 # ---------------------------------------------------------------------------
 # Module-level utilities
@@ -88,18 +96,6 @@ def load_audio(path: Path) -> tuple[np.ndarray, int]:
     """Load a wav file and return a mono float array plus its sample rate."""
     audio, fs = sf.read(path, dtype="float32")
     return audio.reshape(-1), int(fs)
-
-
-def extract_feature(audio: np.ndarray, fs: int, cfg: Config) -> np.ndarray:
-    """Extract PNCC features from raw audio; returns shape (n_pncc, T)."""
-    return extract_pncc(
-        audio,
-        sr=fs,
-        n_fft=cfg.n_fft,
-        win_length=cfg.win_length,
-        hop_length=cfg.hop_length,
-        n_pncc=cfg.n_pncc,
-    )
 
 
 def get_label(path: Path) -> int:
@@ -192,8 +188,9 @@ class Trainer:
             if torch.cuda.is_available()
             else torch.device("cpu")
         )
-        print(f"Device: {self.device}")
+        print(f"[{cfg.variant}] device: {self.device}")
 
+        self._extract_fn = VARIANTS[cfg.variant]
         self._znorm_mean: np.ndarray | None = None
         self._znorm_std: np.ndarray | None = None
 
@@ -202,15 +199,15 @@ class Trainer:
     # ------------------------------------------------------------------
 
     def _load_split(self, data_dir: Path, desc: str) -> tuple[list[np.ndarray], list[int]]:
-        """Load all wav files in data_dir and extract PNCC features."""
+        """Load all wav files in data_dir and extract features."""
         files = sorted(data_dir.glob("*.wav"))
         if not files:
             print(f"  No wav files found in {data_dir}")
             return [], []
         feats, labels = [], []
-        for wav in files:
+        for wav in tqdm(files, desc=desc, leave=False):
             audio, fs = load_audio(wav)
-            feats.append(extract_feature(audio, fs, self.cfg))
+            feats.append(self._extract_fn(audio, fs))
             labels.append(get_label(wav))
         print(f"  {desc}: {len(feats)} files loaded")
         return feats, labels
@@ -253,7 +250,8 @@ class Trainer:
         """Run one training epoch; returns average loss."""
         self.net.train()
         total_loss = 0.0
-        for xb, yb, lengths in self.train_loader:
+        pbar = tqdm(self.train_loader, desc="train", leave=False)
+        for xb, yb, lengths in pbar:
             xb, yb, lengths = xb.to(self.device), yb.to(self.device), lengths.to(self.device)
             self.optimizer.zero_grad()
             loss = self.criterion(self.net(xb, lengths), yb)
@@ -261,6 +259,7 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
             self.optimizer.step()
             total_loss += loss.item() * xb.size(0)
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
         return total_loss / len(self.train_loader.dataset)
 
     @torch.no_grad()
@@ -279,9 +278,9 @@ class Trainer:
 
     @torch.no_grad()
     def _final_eval(
-        self, loader: DataLoader | None, title: str
+        self, loader: DataLoader | None
     ) -> tuple[float, np.ndarray | None]:
-        """Evaluate and plot a confusion matrix; returns (acc, cm)."""
+        """Evaluate and return (accuracy, confusion_matrix)."""
         if loader is None:
             return 0.0, None
         self.net.eval()
@@ -299,20 +298,68 @@ class Trainer:
         cm = metrics.confusion_matrix(
             np.concatenate(all_labels), np.concatenate(all_preds)
         )
-        metrics.ConfusionMatrixDisplay(cm, display_labels=list(range(10))).plot(
-            values_format="d"
-        )
-        plt.title(title)
-        plt.tight_layout()
-        plt.show()
         return acc, cm
+
+    # ------------------------------------------------------------------
+    # Output saving
+    # ------------------------------------------------------------------
+
+    def _save_outputs(
+        self,
+        epoch_log: list[dict],
+        clean_acc: float,
+        acc_5db: float,
+        acc_10db: float,
+        cm_clean: np.ndarray | None,
+        cm_5db: np.ndarray | None,
+        cm_10db: np.ndarray | None,
+        best_checkpoint: dict,
+    ) -> None:
+        """Persist all experiment outputs to cfg.variant_dir."""
+        out = self.cfg.variant_dir
+        out.mkdir(parents=True, exist_ok=True)
+
+        # config.json
+        cfg_dict = dataclasses.asdict(self.cfg)
+        cfg_dict["data_root"] = str(cfg_dict["data_root"])
+        cfg_dict["out_dir"] = str(cfg_dict["out_dir"])
+        (out / "config.json").write_text(json.dumps(cfg_dict, indent=2))
+
+        # metrics.json
+        metrics_dict = {
+            "epoch_log": epoch_log,
+            "final": {"clean": clean_acc, "5db": acc_5db, "10db": acc_10db},
+        }
+        (out / "metrics.json").write_text(json.dumps(metrics_dict, indent=2))
+
+        # checkpoint.pt
+        torch.save(best_checkpoint, out / "checkpoint.pt")
+
+        # confusion matrix PNGs
+        for cm, name, title in [
+            (cm_clean, "cm_clean", "Confusion Matrix — Clean"),
+            (cm_5db,   "cm_5db",   "Confusion Matrix — Noisy 5 dB"),
+            (cm_10db,  "cm_10db",  "Confusion Matrix — Noisy 10 dB"),
+        ]:
+            if cm is None:
+                continue
+            fig, ax = plt.subplots()
+            metrics.ConfusionMatrixDisplay(cm, display_labels=list(range(10))).plot(
+                values_format="d", ax=ax
+            )
+            ax.set_title(f"{self.cfg.variant} — {title}")
+            fig.tight_layout()
+            fig.savefig(out / f"{name}.png", dpi=150)
+            plt.close(fig)
+
+        print(f"\nOutputs saved to {out}/")
 
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        """Run the full pipeline: load → normalise → train → evaluate."""
+        """Run the full pipeline: load → normalise → train → evaluate → save."""
         cfg = self.cfg
 
         # --- Load all splits ---
@@ -322,7 +369,7 @@ class Trainer:
         noisy10_feat, noisy10_label = self._load_split(cfg.test_noisy_10db_dir, "Test noisy 10dB")
 
         feat_dim = train_feat[0].shape[0]
-        print(f"\nFeature dim: {feat_dim}")
+        print(f"\nVariant: {cfg.variant}  |  Feature dim: {feat_dim}")
         print(
             f"Train: {len(train_feat)}  |  Test clean: {len(test_feat)}  "
             f"|  Test noisy 5dB: {len(noisy5_feat)}  |  Test noisy 10dB: {len(noisy10_feat)}"
@@ -360,13 +407,19 @@ class Trainer:
         best_10db, best_10db_ep = 0.0, -1
         saved_checkpoint = None  # saved at best 10 dB accuracy
 
-        for epoch in range(1, cfg.num_epochs + 1):
+        epoch_log: list[dict] = []
+        epoch_bar = tqdm(range(1, cfg.num_epochs + 1), desc="epochs")
+        for epoch in epoch_bar:
             avg_loss = self._train_epoch()
             clean_acc = self._evaluate(self.test_loader)
             acc_5db = self._evaluate(self.noisy5_loader)
             acc_10db = self._evaluate(self.noisy10_loader)
 
-            print(
+            epoch_log.append({
+                "epoch": epoch, "loss": avg_loss,
+                "clean": clean_acc, "5db": acc_5db, "10db": acc_10db,
+            })
+            tqdm.write(
                 f"Epoch {epoch:02d}  loss={avg_loss:.4f}  "
                 f"clean={clean_acc:.4f}  5dB={acc_5db:.4f}  10dB={acc_10db:.4f}"
             )
@@ -379,18 +432,27 @@ class Trainer:
                 best_10db, best_10db_ep = acc_10db, epoch
                 saved_checkpoint = copy.deepcopy(self.net.state_dict())
 
+        # Guard: if no checkpoint was saved (shouldn't happen in practice)
+        if saved_checkpoint is None:
+            saved_checkpoint = copy.deepcopy(self.net.state_dict())
+
         # --- Final evaluation with best checkpoint ---
         self.net = SimpleLSTM(input_size=feat_dim).to(self.device)
         self.net.load_state_dict(saved_checkpoint)
 
-        clean_acc, _ = self._final_eval(self.test_loader, "Confusion Matrix — Clean")
-        acc_5db, _ = self._final_eval(self.noisy5_loader, "Confusion Matrix — Noisy 5 dB")
-        acc_10db, _ = self._final_eval(self.noisy10_loader, "Confusion Matrix — Noisy 10 dB")
+        clean_acc, cm_clean = self._final_eval(self.test_loader)
+        acc_5db,   cm_5db   = self._final_eval(self.noisy5_loader)
+        acc_10db,  cm_10db  = self._final_eval(self.noisy10_loader)
 
         print(f"\nBest checkpoint loaded (epoch {best_10db_ep})")
         print(f"Clean accuracy : {clean_acc:.4f}")
         print(f"5dB  accuracy  : {acc_5db:.4f}")
         print(f"10dB accuracy  : {acc_10db:.4f}")
+
+        self._save_outputs(
+            epoch_log, clean_acc, acc_5db, acc_10db,
+            cm_clean, cm_5db, cm_10db, saved_checkpoint,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -418,8 +480,18 @@ def main(
     gpu_id: int = typer.Option(0, help="CUDA device index (ignored if no GPU available)"),
     seed: int = typer.Option(0, help="Random seed"),
     epochs: int = typer.Option(40, help="Number of training epochs"),
+    variant: str = typer.Option("pncc", help=f"Feature variant. One of: {list(VARIANTS)}"),
+    out_dir: Path = typer.Option(Path("results"), help="Root output directory; results go to <out-dir>/<variant>/"),
 ) -> None:
-    cfg = Config(data_root=data_root, gpu_id=gpu_id, seed=seed, num_epochs=epochs)
+    if variant not in VARIANTS:
+        raise typer.BadParameter(
+            f"Unknown variant '{variant}'. Choose from: {list(VARIANTS)}",
+            param_hint="--variant",
+        )
+    cfg = Config(
+        data_root=data_root, gpu_id=gpu_id, seed=seed,
+        num_epochs=epochs, variant=variant, out_dir=out_dir,
+    )
     Trainer(cfg).run()
 
 

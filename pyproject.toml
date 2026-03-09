@@ -12,6 +12,7 @@ dependencies = [
     "scikit-learn>=1.4",
     "matplotlib>=3.8",
     "typer>=0.12",
+    "tqdm>=4.66",
 ]
 
 # On the GPU training machine, install CUDA torch with:
