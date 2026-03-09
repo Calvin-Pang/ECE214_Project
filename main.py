@@ -1,26 +1,30 @@
 """Noise-robust spoken digit recognition — PNCC feature experiment.
 
-Ported from baseline.ipynb. The only changes vs. the baseline are:
+Ported from baseline.ipynb. Changes vs. the baseline:
   1. extract_feature() uses PNCC instead of MFCC.
   2. Z-score normalisation (fit on training set) is applied to all feature sets.
 
-The LSTM model, training loop, optimizer, and all hyperparameters are
-identical to the baseline notebook and must not be changed for the main results.
+The LSTM model, training loop, optimizer, LR, and batch size are identical to
+the baseline notebook and must not be changed for the main results.
 
 Usage:
-    DATA_ROOT=/path/to/M214_project_data uv run main.py
+    uv run main.py --help
+    uv run main.py --gpu-id 1
+    uv run main.py --gpu-id 0 --data-root /mnt/data
 """
 
 import copy
 import os
 import random
-from glob import glob
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
 import torchaudio
+import typer
 from sklearn import metrics
 from torch.utils.data import DataLoader
 
@@ -29,124 +33,82 @@ from features import extract_pncc
 # Must be set before any CUDA operations for deterministic kernels.
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-SEED = 0
-BATCH_SIZE = 32
-NUM_EPOCHS = 40
-LR = 3e-4
 
-_DATA_ROOT = os.environ.get("DATA_ROOT", "./data")
-TRAIN_DIR = os.path.join(_DATA_ROOT, "train_clean")
-TEST_CLEAN_DIR = os.path.join(_DATA_ROOT, "test_clean")
-TEST_NOISY_5DB_DIR = os.path.join(_DATA_ROOT, "test_snr_5db_babble")
-TEST_NOISY_10DB_DIR = os.path.join(_DATA_ROOT, "test_snr_10db_babble")
+@dataclass
+class Config:
+    """All hyperparameters and paths for one experiment run.
 
-# PNCC / framing parameters — matched to the MFCC baseline
-N_PNCC = 13
-WIN_LENGTH = 200   # 25 ms at 8 kHz
-HOP_LENGTH = 80    # 10 ms at 8 kHz
-N_FFT = 256
-
-
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
-
-
-def set_seed(seed: int = 42) -> None:
-    """Seed all RNGs for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-# ---------------------------------------------------------------------------
-# Audio loading
-# ---------------------------------------------------------------------------
-
-
-def load_audio(audio_file: str) -> tuple[np.ndarray, int]:
-    """Load a wav file and return a mono float array plus its sample rate."""
-    audio, fs = torchaudio.load(audio_file)
-    audio = audio.numpy().reshape(-1)
-    return audio, int(fs)
-
-
-# ---------------------------------------------------------------------------
-# Feature extraction
-# ---------------------------------------------------------------------------
-
-
-def extract_feature(audio: np.ndarray, fs: int) -> np.ndarray:
-    """Extract PNCC features from raw audio.
-
-    Returns a 2-D array of shape (N_PNCC, T) where T is the number of frames.
-    Drop-in replacement for the MFCC baseline's extract_feature().
+    lr and batch_size are fixed to match the baseline and must not be changed
+    for the main results (project requirement).
     """
+
+    data_root: Path = field(default_factory=lambda: Path("data"))
+    gpu_id: int = 0
+    seed: int = 0
+    num_epochs: int = 40
+
+    # Fixed baseline hyperparameters — do not expose as CLI options
+    batch_size: int = 32
+    lr: float = 3e-4
+
+    # PNCC framing — matched to MFCC baseline (8 kHz audio)
+    n_pncc: int = 13
+    win_length: int = 200  # 25 ms at 8 kHz
+    hop_length: int = 80   # 10 ms at 8 kHz
+    n_fft: int = 256
+
+    @property
+    def train_dir(self) -> Path:
+        return self.data_root / "train_clean"
+
+    @property
+    def test_clean_dir(self) -> Path:
+        return self.data_root / "test_clean"
+
+    @property
+    def test_noisy_5db_dir(self) -> Path:
+        return self.data_root / "test_snr_5db_babble"
+
+    @property
+    def test_noisy_10db_dir(self) -> Path:
+        return self.data_root / "test_snr_10db_babble"
+
+
+# ---------------------------------------------------------------------------
+# Module-level utilities
+# ---------------------------------------------------------------------------
+
+
+def load_audio(path: Path) -> tuple[np.ndarray, int]:
+    """Load a wav file and return a mono float array plus its sample rate."""
+    audio, fs = torchaudio.load(path)
+    return audio.numpy().reshape(-1), int(fs)
+
+
+def extract_feature(audio: np.ndarray, fs: int, cfg: Config) -> np.ndarray:
+    """Extract PNCC features from raw audio; returns shape (n_pncc, T)."""
     return extract_pncc(
         audio,
         sr=fs,
-        n_fft=N_FFT,
-        win_length=WIN_LENGTH,
-        hop_length=HOP_LENGTH,
-        n_pncc=N_PNCC,
+        n_fft=cfg.n_fft,
+        win_length=cfg.win_length,
+        hop_length=cfg.hop_length,
+        n_pncc=cfg.n_pncc,
     )
 
 
-def extract_feature_from_file(audio_file: str) -> np.ndarray:
-    """Load a wav file and return its PNCC feature matrix."""
-    audio, fs = load_audio(audio_file)
-    return extract_feature(audio, fs)
+def get_label(path: Path) -> int:
+    """Extract integer digit label from filename (format: {label}_*.wav)."""
+    return int(path.stem.split("_")[0])
 
 
 # ---------------------------------------------------------------------------
-# Z-score normalisation (fit on training set, apply to all splits)
-# ---------------------------------------------------------------------------
-
-
-def znorm_fit(feats: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """Compute per-channel mean and std from a list of (F, T) feature arrays.
-
-    Statistics are derived exclusively from the training set to avoid
-    data leakage into the evaluation splits.
-
-    Args:
-        feats: List of (F, T) numpy arrays.
-
-    Returns:
-        mean: Shape (F, 1), per-channel mean across all training frames.
-        std:  Shape (F, 1), per-channel std  across all training frames.
-    """
-    all_frames = np.concatenate(feats, axis=1)  # (F, total_frames)
-    mean = all_frames.mean(axis=1, keepdims=True)
-    std = all_frames.std(axis=1, keepdims=True)
-    return mean, std
-
-
-def znorm_apply(
-    feats: list[np.ndarray],
-    mean: np.ndarray,
-    std: np.ndarray,
-) -> list[np.ndarray]:
-    """Apply pre-computed z-norm statistics to a list of (F, T) arrays.
-
-    Args:
-        feats: List of (F, T) numpy arrays.
-        mean:  Shape (F, 1) mean from znorm_fit().
-        std:   Shape (F, 1) std  from znorm_fit().
-
-    Returns:
-        List of normalised (F, T) arrays with the same dtypes.
-    """
-    return [(f - mean) / (std + 1e-8) for f in feats]
-
-
-# ---------------------------------------------------------------------------
-# Dataset & DataLoader
+# Dataset & DataLoader — unchanged from baseline
 # ---------------------------------------------------------------------------
 
 
@@ -168,47 +130,11 @@ class FeatureDataset(torch.utils.data.Dataset):
 def collate_pad(batch):
     """Pad variable-length sequences to the longest in the batch."""
     xs, ys, lens = zip(*batch)
-    B = len(xs)
-    F = xs[0].shape[0]
-    T_max = max(lens)
+    B, F, T_max = len(xs), xs[0].shape[0], max(lens)
     xb = torch.zeros(B, 1, F, T_max, dtype=xs[0].dtype)
     for i, x in enumerate(xs):
         xb[i, 0, :, : x.shape[1]] = x
     return xb, torch.tensor(ys, dtype=torch.long), torch.tensor(lens, dtype=torch.long)
-
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-
-
-def get_label(file_name: str) -> int:
-    """Extract integer digit label from filename (format: {label}_*.wav)."""
-    base = os.path.splitext(os.path.basename(file_name))[0]
-    return int(base.split("_")[0])
-
-
-def load_dir(data_dir: str, desc: str = "Loading") -> tuple[list[np.ndarray], list[int]]:
-    """Load all wav files from a directory and extract PNCC features.
-
-    Args:
-        data_dir: Path to directory containing *.wav files.
-        desc: Label used in the progress message.
-
-    Returns:
-        feats:  List of (F, T) numpy arrays, one per file.
-        labels: Corresponding integer digit labels.
-    """
-    files = sorted(glob(os.path.join(data_dir, "*.wav")))
-    if not files:
-        print(f"  No wav files found in {data_dir}")
-        return [], []
-    feats, labels = [], []
-    for wav in files:
-        feats.append(extract_feature_from_file(wav))
-        labels.append(get_label(wav))
-    print(f"  {desc}: {len(feats)} files loaded")
-    return feats, labels
 
 
 # ---------------------------------------------------------------------------
@@ -228,10 +154,7 @@ class SimpleLSTM(nn.Module):
             dropout=0.2,
         )
         self.classifier = nn.Sequential(
-            nn.Linear(256, 32),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(32, 10),
+            nn.Linear(256, 32), nn.ReLU(), nn.Dropout(0.3), nn.Linear(32, 10),
         )
 
     def forward(self, x, lengths):
@@ -246,217 +169,259 @@ class SimpleLSTM(nn.Module):
 
         # Mean pooling over valid frames (ignore padding)
         B, T_max, D = out.shape
-        device = out.device
-
-        mask = torch.arange(T_max, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        mask = torch.arange(T_max, device=out.device).unsqueeze(0) < lengths.unsqueeze(1)
         mask_f = mask.unsqueeze(-1).float()
         out_sum = (out * mask_f).sum(dim=1)           # (B, D)
         denom = mask_f.sum(dim=1).clamp(min=1.0)      # (B, 1)
-        mean = out_sum / denom                         # (B, D)
-
-        return self.classifier(mean)
+        return self.classifier(out_sum / denom)
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Trainer
 # ---------------------------------------------------------------------------
 
 
-@torch.no_grad()
-def evaluate(model, loader, device, plot_cm=False, class_names=None, title=None, save_path=None):
-    """Evaluate the model and optionally plot a confusion matrix.
+class Trainer:
+    """Encapsulates the full training and evaluation pipeline."""
 
-    Returns:
-        acc (float) when plot_cm is False.
-        (acc, cm) when plot_cm is True.
-    """
-    model.eval()
-    if loader is None:
-        return (0.0, None) if plot_cm else 0.0
-
-    all_preds, all_labels = [], []
-    correct, total = 0, 0
-
-    for xb, yb, lengths in loader:
-        xb, yb, lengths = xb.to(device), yb.to(device), lengths.to(device)
-        logits = model(xb, lengths)
-        preds = logits.argmax(dim=1)
-        correct += (preds == yb).sum().item()
-        total += yb.size(0)
-        if plot_cm:
-            all_preds.append(preds.detach().cpu().numpy())
-            all_labels.append(yb.detach().cpu().numpy())
-
-    acc = correct / total if total > 0 else 0.0
-
-    if not plot_cm:
-        return acc
-
-    y_pred = np.concatenate(all_preds) if all_preds else np.array([], dtype=np.int64)
-    y_true = np.concatenate(all_labels) if all_labels else np.array([], dtype=np.int64)
-    cm = metrics.confusion_matrix(y_true, y_pred)
-
-    disp = metrics.ConfusionMatrixDisplay(
-        confusion_matrix=cm,
-        display_labels=class_names,
-    )
-    disp.plot(values_format="d")
-    plt.title(title or "Confusion Matrix")
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150)
-        plt.close()
-    else:
-        plt.show()
-
-    return acc, cm
-
-
-# ---------------------------------------------------------------------------
-# Main training / evaluation
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    set_seed(SEED)
-
-    # --- Load features ---
-    train_feat, train_label = load_dir(TRAIN_DIR, desc="Train")
-    test_feat, test_label = load_dir(TEST_CLEAN_DIR, desc="Test clean")
-    noisy5_feat, noisy5_label = load_dir(TEST_NOISY_5DB_DIR, desc="Test noisy 5dB")
-    noisy10_feat, noisy10_label = load_dir(TEST_NOISY_10DB_DIR, desc="Test noisy 10dB")
-
-    feat_dim = train_feat[0].shape[0]
-    print(f"\nFeature dim: {feat_dim}")
-    print(
-        f"Train: {len(train_feat)}  |  Test clean: {len(test_feat)}  "
-        f"|  Test noisy 5dB: {len(noisy5_feat)}  |  Test noisy 10dB: {len(noisy10_feat)}"
-    )
-    for name, flist in [
-        ("Train", train_feat),
-        ("Test clean", test_feat),
-        ("Noisy 5dB", noisy5_feat),
-        ("Noisy 10dB", noisy10_feat),
-    ]:
-        if flist:
-            lengths = [f.shape[1] for f in flist]
-            print(f"  {name:10s} frames: min={min(lengths)}, max={max(lengths)}, mean={np.mean(lengths):.1f}")
-
-    # --- Z-score normalisation (fit on train, apply to all splits) ---
-    mean, std = znorm_fit(train_feat)
-    train_feat = znorm_apply(train_feat, mean, std)
-    test_feat = znorm_apply(test_feat, mean, std)
-    noisy5_feat = znorm_apply(noisy5_feat, mean, std)
-    noisy10_feat = znorm_apply(noisy10_feat, mean, std)
-
-    # --- Build label arrays ---
-    y_train = np.array(train_label, dtype=np.int64)
-    y_test = np.array(test_label, dtype=np.int64)
-    y_noisy5 = np.array(noisy5_label, dtype=np.int64)
-    y_noisy10 = np.array(noisy10_label, dtype=np.int64)
-
-    # --- DataLoaders ---
-    loader_g = torch.Generator().manual_seed(SEED)
-    train_loader = DataLoader(
-        FeatureDataset(train_feat, y_train),
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        collate_fn=collate_pad,
-        generator=loader_g,
-    )
-    test_loader = DataLoader(
-        FeatureDataset(test_feat, y_test),
-        batch_size=16,
-        shuffle=False,
-        collate_fn=collate_pad,
-    )
-    noisy5_loader = (
-        DataLoader(
-            FeatureDataset(noisy5_feat, y_noisy5),
-            batch_size=16,
-            shuffle=False,
-            collate_fn=collate_pad,
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._set_seed(cfg.seed)
+        self.device = (
+            torch.device(f"cuda:{cfg.gpu_id}")
+            if torch.cuda.is_available()
+            else torch.device("cpu")
         )
-        if noisy5_feat
-        else None
-    )
-    noisy10_loader = (
-        DataLoader(
-            FeatureDataset(noisy10_feat, y_noisy10),
-            batch_size=16,
-            shuffle=False,
+        print(f"Device: {self.device}")
+
+        self._znorm_mean: np.ndarray | None = None
+        self._znorm_std: np.ndarray | None = None
+
+    # ------------------------------------------------------------------
+    # Data helpers
+    # ------------------------------------------------------------------
+
+    def _load_split(self, data_dir: Path, desc: str) -> tuple[list[np.ndarray], list[int]]:
+        """Load all wav files in data_dir and extract PNCC features."""
+        files = sorted(data_dir.glob("*.wav"))
+        if not files:
+            print(f"  No wav files found in {data_dir}")
+            return [], []
+        feats, labels = [], []
+        for wav in files:
+            audio, fs = load_audio(wav)
+            feats.append(extract_feature(audio, fs, self.cfg))
+            labels.append(get_label(wav))
+        print(f"  {desc}: {len(feats)} files loaded")
+        return feats, labels
+
+    def _znorm_fit(self, feats: list[np.ndarray]) -> None:
+        """Fit z-norm statistics from training features (stored on self)."""
+        all_frames = np.concatenate(feats, axis=1)  # (F, total_T)
+        self._znorm_mean = all_frames.mean(axis=1, keepdims=True)
+        self._znorm_std = all_frames.std(axis=1, keepdims=True)
+
+    def _znorm_apply(self, feats: list[np.ndarray]) -> list[np.ndarray]:
+        """Apply stored z-norm statistics to a list of (F, T) arrays."""
+        return [(f - self._znorm_mean) / (self._znorm_std + 1e-8) for f in feats]
+
+    def _make_loader(
+        self,
+        feats: list[np.ndarray],
+        labels: list[int],
+        *,
+        shuffle: bool,
+        batch_size: int,
+        generator: torch.Generator | None = None,
+    ) -> DataLoader | None:
+        """Build a DataLoader from feature/label lists, or None if empty."""
+        if not feats:
+            return None
+        return DataLoader(
+            FeatureDataset(feats, np.array(labels, dtype=np.int64)),
+            batch_size=batch_size,
+            shuffle=shuffle,
             collate_fn=collate_pad,
+            generator=generator,
         )
-        if noisy10_feat
-        else None
-    )
 
-    # --- Model, loss, optimiser — identical to baseline ---
-    set_seed(SEED)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net = SimpleLSTM(input_size=feat_dim).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=LR)
+    # ------------------------------------------------------------------
+    # Training / evaluation
+    # ------------------------------------------------------------------
 
-    best_clean, best_clean_ep = 0.0, -1
-    best_5db, best_5db_ep = 0.0, -1
-    best_10db, best_10db_ep = 0.0, -1
-
-    # Save the checkpoint with the best 10 dB accuracy.
-    saved_checkpoint = None
-
-    for epoch in range(1, NUM_EPOCHS + 1):
-        net.train()
+    def _train_epoch(self) -> float:
+        """Run one training epoch; returns average loss."""
+        self.net.train()
         total_loss = 0.0
-        for xb, yb, lengths in train_loader:
-            xb, yb, lengths = xb.to(device), yb.to(device), lengths.to(device)
-            optimizer.zero_grad()
-            loss = criterion(net(xb, lengths), yb)
+        for xb, yb, lengths in self.train_loader:
+            xb, yb, lengths = xb.to(self.device), yb.to(self.device), lengths.to(self.device)
+            self.optimizer.zero_grad()
+            loss = self.criterion(self.net(xb, lengths), yb)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+            self.optimizer.step()
             total_loss += loss.item() * xb.size(0)
+        return total_loss / len(self.train_loader.dataset)
 
-        avg_loss = total_loss / len(train_loader.dataset)
-        clean_acc = evaluate(net, test_loader, device)
-        acc_5db = evaluate(net, noisy5_loader, device)
-        acc_10db = evaluate(net, noisy10_loader, device)
+    @torch.no_grad()
+    def _evaluate(self, loader: DataLoader | None) -> float:
+        """Return accuracy on a loader, or 0.0 if loader is None."""
+        if loader is None:
+            return 0.0
+        self.net.eval()
+        correct = total = 0
+        for xb, yb, lengths in loader:
+            xb, yb, lengths = xb.to(self.device), yb.to(self.device), lengths.to(self.device)
+            preds = self.net(xb, lengths).argmax(dim=1)
+            correct += (preds == yb).sum().item()
+            total += yb.size(0)
+        return correct / total if total > 0 else 0.0
 
-        print(
-            f"Epoch {epoch:02d}  loss={avg_loss:.4f}  "
-            f"clean={clean_acc:.4f}  5dB={acc_5db:.4f}  10dB={acc_10db:.4f}"
+    @torch.no_grad()
+    def _final_eval(
+        self, loader: DataLoader | None, title: str
+    ) -> tuple[float, np.ndarray | None]:
+        """Evaluate and plot a confusion matrix; returns (acc, cm)."""
+        if loader is None:
+            return 0.0, None
+        self.net.eval()
+        all_preds, all_labels = [], []
+        correct = total = 0
+        for xb, yb, lengths in loader:
+            xb, yb, lengths = xb.to(self.device), yb.to(self.device), lengths.to(self.device)
+            preds = self.net(xb, lengths).argmax(dim=1)
+            correct += (preds == yb).sum().item()
+            total += yb.size(0)
+            all_preds.append(preds.cpu().numpy())
+            all_labels.append(yb.cpu().numpy())
+
+        acc = correct / total if total > 0 else 0.0
+        cm = metrics.confusion_matrix(
+            np.concatenate(all_labels), np.concatenate(all_preds)
         )
+        metrics.ConfusionMatrixDisplay(cm, display_labels=list(range(10))).plot(
+            values_format="d"
+        )
+        plt.title(title)
+        plt.tight_layout()
+        plt.show()
+        return acc, cm
 
-        if clean_acc > best_clean:
-            best_clean, best_clean_ep = clean_acc, epoch
-        if acc_5db > best_5db:
-            best_5db, best_5db_ep = acc_5db, epoch
-        if acc_10db > best_10db:
-            best_10db, best_10db_ep = acc_10db, epoch
-            saved_checkpoint = copy.deepcopy(net.state_dict())
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
-    # --- Final evaluation with best checkpoint ---
-    net = SimpleLSTM(input_size=feat_dim).to(device)
-    net.load_state_dict(saved_checkpoint)
+    def run(self) -> None:
+        """Run the full pipeline: load → normalise → train → evaluate."""
+        cfg = self.cfg
 
-    clean_acc, cm_clean = evaluate(
-        net, test_loader, device,
-        plot_cm=True, class_names=list(range(10)), title="Confusion Matrix — Clean",
-    )
-    acc_5db, cm_5db = evaluate(
-        net, noisy5_loader, device,
-        plot_cm=True, class_names=list(range(10)), title="Confusion Matrix — Noisy 5 dB",
-    )
-    acc_10db, cm_10db = evaluate(
-        net, noisy10_loader, device,
-        plot_cm=True, class_names=list(range(10)), title="Confusion Matrix — Noisy 10 dB",
-    )
+        # --- Load all splits ---
+        train_feat, train_label = self._load_split(cfg.train_dir, "Train")
+        test_feat, test_label = self._load_split(cfg.test_clean_dir, "Test clean")
+        noisy5_feat, noisy5_label = self._load_split(cfg.test_noisy_5db_dir, "Test noisy 5dB")
+        noisy10_feat, noisy10_label = self._load_split(cfg.test_noisy_10db_dir, "Test noisy 10dB")
 
-    print(f"\nBest checkpoint loaded (epoch {best_10db_ep})")
-    print(f"Clean accuracy : {clean_acc:.4f}")
-    print(f"5dB  accuracy  : {acc_5db:.4f}")
-    print(f"10dB accuracy  : {acc_10db:.4f}")
+        feat_dim = train_feat[0].shape[0]
+        print(f"\nFeature dim: {feat_dim}")
+        print(
+            f"Train: {len(train_feat)}  |  Test clean: {len(test_feat)}  "
+            f"|  Test noisy 5dB: {len(noisy5_feat)}  |  Test noisy 10dB: {len(noisy10_feat)}"
+        )
+        for name, flist in [
+            ("Train", train_feat), ("Test clean", test_feat),
+            ("Noisy 5dB", noisy5_feat), ("Noisy 10dB", noisy10_feat),
+        ]:
+            if flist:
+                lengths = [f.shape[1] for f in flist]
+                print(f"  {name:10s} frames: min={min(lengths)}, max={max(lengths)}, mean={np.mean(lengths):.1f}")
+
+        # --- Z-norm (fit on train, apply to all) ---
+        self._znorm_fit(train_feat)
+        train_feat = self._znorm_apply(train_feat)
+        test_feat = self._znorm_apply(test_feat)
+        noisy5_feat = self._znorm_apply(noisy5_feat)
+        noisy10_feat = self._znorm_apply(noisy10_feat)
+
+        # --- DataLoaders ---
+        loader_g = torch.Generator().manual_seed(cfg.seed)
+        self.train_loader = self._make_loader(train_feat, train_label, shuffle=True, batch_size=cfg.batch_size, generator=loader_g)
+        self.test_loader = self._make_loader(test_feat, test_label, shuffle=False, batch_size=16)
+        self.noisy5_loader = self._make_loader(noisy5_feat, noisy5_label, shuffle=False, batch_size=16)
+        self.noisy10_loader = self._make_loader(noisy10_feat, noisy10_label, shuffle=False, batch_size=16)
+
+        # --- Model, loss, optimiser — identical to baseline ---
+        self._set_seed(cfg.seed)
+        self.net = SimpleLSTM(input_size=feat_dim).to(self.device)
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=cfg.lr)
+
+        best_clean, best_clean_ep = 0.0, -1
+        best_5db, best_5db_ep = 0.0, -1
+        best_10db, best_10db_ep = 0.0, -1
+        saved_checkpoint = None  # saved at best 10 dB accuracy
+
+        for epoch in range(1, cfg.num_epochs + 1):
+            avg_loss = self._train_epoch()
+            clean_acc = self._evaluate(self.test_loader)
+            acc_5db = self._evaluate(self.noisy5_loader)
+            acc_10db = self._evaluate(self.noisy10_loader)
+
+            print(
+                f"Epoch {epoch:02d}  loss={avg_loss:.4f}  "
+                f"clean={clean_acc:.4f}  5dB={acc_5db:.4f}  10dB={acc_10db:.4f}"
+            )
+
+            if clean_acc > best_clean:
+                best_clean, best_clean_ep = clean_acc, epoch
+            if acc_5db > best_5db:
+                best_5db, best_5db_ep = acc_5db, epoch
+            if acc_10db > best_10db:
+                best_10db, best_10db_ep = acc_10db, epoch
+                saved_checkpoint = copy.deepcopy(self.net.state_dict())
+
+        # --- Final evaluation with best checkpoint ---
+        self.net = SimpleLSTM(input_size=feat_dim).to(self.device)
+        self.net.load_state_dict(saved_checkpoint)
+
+        clean_acc, _ = self._final_eval(self.test_loader, "Confusion Matrix — Clean")
+        acc_5db, _ = self._final_eval(self.noisy5_loader, "Confusion Matrix — Noisy 5 dB")
+        acc_10db, _ = self._final_eval(self.noisy10_loader, "Confusion Matrix — Noisy 10 dB")
+
+        print(f"\nBest checkpoint loaded (epoch {best_10db_ep})")
+        print(f"Clean accuracy : {clean_acc:.4f}")
+        print(f"5dB  accuracy  : {acc_5db:.4f}")
+        print(f"10dB accuracy  : {acc_10db:.4f}")
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _set_seed(seed: int) -> None:
+        """Seed all RNGs for reproducibility."""
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+app = typer.Typer(add_completion=False)
+
+
+@app.command()
+def main(
+    data_root: Path = typer.Option(Path("data"), help="Root directory of M214_project_data"),
+    gpu_id: int = typer.Option(0, help="CUDA device index (ignored if no GPU available)"),
+    seed: int = typer.Option(0, help="Random seed"),
+    epochs: int = typer.Option(40, help="Number of training epochs"),
+) -> None:
+    cfg = Config(data_root=data_root, gpu_id=gpu_id, seed=seed, num_epochs=epochs)
+    Trainer(cfg).run()
 
 
 if __name__ == "__main__":
-    main()
+    app()
