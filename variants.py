@@ -147,17 +147,35 @@ def _pncc_contrast(audio: np.ndarray, sr: int) -> np.ndarray:
     return np.concatenate(_trim(pncc, contrast_d), axis=0)
 
 
+def _pncc_n40_contrast(audio: np.ndarray, sr: int) -> np.ndarray:
+    """PNCC 40 coeffs + Δ + ΔΔ + spectral contrast + Δ + ΔΔ. Shape (141, T).
+
+    Kitchen-sink of noise-robust features only: 40-coeff PNCC captures fine
+    spectral detail; spectral contrast adds complementary peak-vs-valley info.
+    """
+    pncc = _pncc_n40(audio, sr)   # (120, T)
+
+    contrast = librosa.feature.spectral_contrast(
+        y=audio.astype(np.float32), sr=sr,
+        n_fft=_N_FFT, hop_length=_HOP, win_length=_WIN, center=False, fmin=50.0,
+    ).astype(np.float32)           # (7, T)
+    contrast_d = _with_deltas(contrast)  # (21, T)
+
+    return np.concatenate(_trim(pncc, contrast_d), axis=0)
+
+
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 VARIANTS: dict[str, Callable[[np.ndarray, int], np.ndarray]] = {
-    "pncc":          _pncc,          # 13  — bug-fixed PNCC baseline
-    "pncc_39":       _pncc_39,       # 39  — PNCC + Δ + ΔΔ
-    "pncc_42":       _pncc_42,       # 42  — pncc_39 + log-energy + RMS + ZCR
-    "mfcc":          _mfcc,          # 13  — MFCC anchor (matches teammate baseline)
-    "mfcc_39":       _mfcc_39,       # 39  — MFCC + Δ + ΔΔ (matches teammate's best)
-    "pncc_mfcc_78":  _pncc_mfcc_78,  # 78  — stacked PNCC_39 + MFCC_39
-    "pncc_n40":      _pncc_n40,      # 120 — PNCC 40 coeffs + Δ + ΔΔ
-    "pncc_contrast": _pncc_contrast, # 60  — PNCC_39 + spectral contrast + Δ + ΔΔ
+    "pncc":              _pncc,              # 13  — bug-fixed PNCC baseline
+    "pncc_39":           _pncc_39,           # 39  — PNCC + Δ + ΔΔ
+    "pncc_42":           _pncc_42,           # 42  — pncc_39 + log-energy + RMS + ZCR
+    "mfcc":              _mfcc,              # 13  — MFCC anchor (matches teammate baseline)
+    "mfcc_39":           _mfcc_39,           # 39  — MFCC + Δ + ΔΔ (matches teammate's best)
+    "pncc_mfcc_78":      _pncc_mfcc_78,      # 78  — stacked PNCC_39 + MFCC_39
+    "pncc_n40":          _pncc_n40,          # 120 — PNCC 40 coeffs + Δ + ΔΔ
+    "pncc_contrast":     _pncc_contrast,     # 60  — PNCC_39 + spectral contrast + Δ + ΔΔ
+    "pncc_n40_contrast": _pncc_n40_contrast, # 141 — PNCC_n40 + spectral contrast + Δ + ΔΔ
 }

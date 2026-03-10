@@ -18,7 +18,8 @@ VARIANTS = {
     "mfcc_39":       39,
     "pncc_mfcc_78":  78,
     "pncc_n40":     120,
-    "pncc_contrast": 60,
+    "pncc_contrast":     60,
+    "pncc_n40_contrast": 141,
 }
 
 app = typer.Typer(add_completion=False)
