@@ -137,9 +137,10 @@ def _pncc_contrast(audio: np.ndarray, sr: int) -> np.ndarray:
     pncc = _pncc_39(audio, sr)    # (39, T)
 
     # 7 contrast bands (6 subbands + 1 overall), with deltas -> (21, T)
+    # fmin=50 so bands top out at 50*2^6=3200 Hz, safely below 8kHz Nyquist (4000 Hz)
     contrast = librosa.feature.spectral_contrast(
         y=audio.astype(np.float32), sr=sr,
-        n_fft=_N_FFT, hop_length=_HOP, win_length=_WIN, center=False,
+        n_fft=_N_FFT, hop_length=_HOP, win_length=_WIN, center=False, fmin=50.0,
     ).astype(np.float32)           # (7, T)
     contrast_d = _with_deltas(contrast)  # (21, T)
 
